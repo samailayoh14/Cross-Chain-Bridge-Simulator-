@@ -7,14 +7,19 @@
 (define-constant ERR-ALREADY-PROCESSED (err u104))
 (define-constant ERR-INVALID-RECIPIENT (err u105))
 (define-constant ERR-CHAIN-NOT-SUPPORTED (err u106))
+(define-constant ERR-WITHDRAWAL-NOT-FOUND (err u107))
+(define-constant ERR-WITHDRAWAL-LOCKED (err u108))
+(define-constant ERR-WITHDRAWAL-ALREADY-CLAIMED (err u109))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MAX-CHAINS u10)
 (define-constant MIN-BRIDGE-AMOUNT u1000000)
+(define-constant DEFAULT-TIMELOCK-BLOCKS u144)
 
 (define-data-var total-chains uint u0)
 (define-data-var bridge-fee uint u10000)
 (define-data-var is-bridge-active bool true)
+(define-data-var withdrawal-counter uint u0)
 
 (define-map chain-registry 
     { chain-id: uint } 
@@ -27,7 +32,7 @@
 )
 
 (define-map user-balances
-    { user: principal, chain-id: uint }
+    { user: principal, balance-chain-id: uint }
     { 
         locked: uint,
         wrapped: uint
@@ -48,19 +53,41 @@
 )
 
 (define-map chain-validators
-    { chain-id: uint, validator: principal }
+    { validator-chain-id: uint, validator: principal }
     { is-active: bool }
 )
 
-(define-private (is-valid-chain (chain-id uint))
-    (match (map-get? chain-registry { chain-id: chain-id })
+(define-map chain-timelocks
+    { timelock-chain-id: uint }
+    { timelock-blocks: uint }
+)
+
+(define-map withdrawal-queue
+    { withdrawal-id: uint }
+    {
+        user: principal,
+        target-chain-id: uint,
+        amount: uint,
+        requested-at: uint,
+        unlock-at: uint,
+        claimed: bool
+    }
+)
+
+(define-map user-withdrawal-ids
+    { user: principal, user-chain-id: uint }
+    { withdrawal-ids: (list 50 uint) }
+)
+
+(define-private (is-valid-chain (cid uint))
+    (match (map-get? chain-registry { chain-id: cid })
         chain-info (get is-active chain-info)
         false
     )
 )
 
-(define-private (get-user-balance (user principal) (chain-id uint) (balance-type (string-ascii 10)))
-    (match (map-get? user-balances { user: user, chain-id: chain-id })
+(define-private (get-user-balance (user principal) (cid uint) (balance-type (string-ascii 10)))
+    (match (map-get? user-balances { user: user, balance-chain-id: cid })
         balance-info 
             (if (is-eq balance-type "locked")
                 (get locked balance-info)
@@ -70,18 +97,18 @@
     )
 )
 
-(define-private (update-user-balance (user principal) (chain-id uint) (locked-amount uint) (wrapped-amount uint))
+(define-private (update-user-balance (user principal) (cid uint) (locked-amount uint) (wrapped-amount uint))
     (map-set user-balances
-        { user: user, chain-id: chain-id }
+        { user: user, balance-chain-id: cid }
         { locked: locked-amount, wrapped: wrapped-amount }
     )
 )
 
-(define-private (update-chain-totals (chain-id uint) (locked-delta int) (minted-delta int))
-    (match (map-get? chain-registry { chain-id: chain-id })
+(define-private (update-chain-totals (cid uint) (locked-delta int) (minted-delta int))
+    (match (map-get? chain-registry { chain-id: cid })
         chain-info
             (map-set chain-registry
-                { chain-id: chain-id }
+                { chain-id: cid }
                 {
                     name: (get name chain-info),
                     is-active: (get is-active chain-info),
@@ -93,14 +120,33 @@
     )
 )
 
-(define-public (register-chain (chain-id uint) (name (string-ascii 20)))
+(define-private (get-chain-timelock (cid uint))
+    (match (map-get? chain-timelocks { timelock-chain-id: cid })
+        timelock-info (get timelock-blocks timelock-info)
+        DEFAULT-TIMELOCK-BLOCKS
+    )
+)
+
+(define-private (add-withdrawal-id-to-user (user principal) (cid uint) (withdrawal-id uint))
+    (let
+        (
+            (current-ids (default-to (list) (get withdrawal-ids (map-get? user-withdrawal-ids { user: user, user-chain-id: cid }))))
+        )
+        (map-set user-withdrawal-ids
+            { user: user, user-chain-id: cid }
+            { withdrawal-ids: (unwrap-panic (as-max-len? (append current-ids withdrawal-id) u50)) }
+        )
+    )
+)
+
+(define-public (register-chain (cid uint) (name (string-ascii 20)))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
         (asserts! (< (var-get total-chains) MAX-CHAINS) ERR-INVALID-CHAIN)
-        (asserts! (is-none (map-get? chain-registry { chain-id: chain-id })) ERR-INVALID-CHAIN)
+        (asserts! (is-none (map-get? chain-registry { chain-id: cid })) ERR-INVALID-CHAIN)
         
         (map-set chain-registry
-            { chain-id: chain-id }
+            { chain-id: cid }
             {
                 name: name,
                 is-active: true,
@@ -109,83 +155,101 @@
             }
         )
         (var-set total-chains (+ (var-get total-chains) u1))
-        (ok chain-id)
+        (ok cid)
     )
 )
 
-(define-public (add-validator (chain-id uint) (validator principal))
+(define-public (add-validator (cid uint) (validator principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
-        (asserts! (is-valid-chain chain-id) ERR-INVALID-CHAIN)
+        (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
         
         (map-set chain-validators
-            { chain-id: chain-id, validator: validator }
+            { validator-chain-id: cid, validator: validator }
             { is-active: true }
         )
         (ok true)
     )
 )
 
-(define-public (lock-tokens (chain-id uint) (amount uint))
+(define-public (lock-tokens (cid uint) (amount uint))
     (let
         (
-            (current-locked (get-user-balance tx-sender chain-id "locked"))
+            (current-locked (get-user-balance tx-sender cid "locked"))
             (current-balance (ft-get-balance bridge-token tx-sender))
         )
         (asserts! (var-get is-bridge-active) ERR-NOT-AUTHORIZED)
-        (asserts! (is-valid-chain chain-id) ERR-INVALID-CHAIN)
+        (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
         (asserts! (>= amount MIN-BRIDGE-AMOUNT) ERR-INVALID-AMOUNT)
         (asserts! (>= current-balance amount) ERR-INSUFFICIENT-BALANCE)
         
         (try! (ft-burn? bridge-token amount tx-sender))
-        (update-user-balance tx-sender chain-id (+ current-locked amount) (get-user-balance tx-sender chain-id "wrapped"))
-        (update-chain-totals chain-id (to-int amount) 0)
+        (update-user-balance tx-sender cid (+ current-locked amount) (get-user-balance tx-sender cid "wrapped"))
+        (update-chain-totals cid (to-int amount) 0)
         (ok amount)
     )
 )
 
-(define-public (unlock-tokens (chain-id uint) (amount uint))
+(define-public (unlock-tokens (cid uint) (amount uint))
     (let
         (
-            (current-locked (get-user-balance tx-sender chain-id "locked"))
+            (current-locked (get-user-balance tx-sender cid "locked"))
+            (withdrawal-id (var-get withdrawal-counter))
+            (timelock-blocks (get-chain-timelock cid))
+            (current-height stacks-block-height)
+            (unlock-height (+ current-height timelock-blocks))
         )
         (asserts! (var-get is-bridge-active) ERR-NOT-AUTHORIZED)
-        (asserts! (is-valid-chain chain-id) ERR-INVALID-CHAIN)
+        (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
         (asserts! (>= current-locked amount) ERR-INSUFFICIENT-BALANCE)
         
-        (try! (ft-mint? bridge-token amount tx-sender))
-        (update-user-balance tx-sender chain-id (- current-locked amount) (get-user-balance tx-sender chain-id "wrapped"))
-        (update-chain-totals chain-id (- (to-int amount)) 0)
-        (ok amount)
+        (update-user-balance tx-sender cid (- current-locked amount) (get-user-balance tx-sender cid "wrapped"))
+        (update-chain-totals cid (- (to-int amount)) 0)
+        
+        (map-set withdrawal-queue
+            { withdrawal-id: withdrawal-id }
+            {
+                user: tx-sender,
+                target-chain-id: cid,
+                amount: amount,
+                requested-at: current-height,
+                unlock-at: unlock-height,
+                claimed: false
+            }
+        )
+        
+        (add-withdrawal-id-to-user tx-sender cid withdrawal-id)
+        (var-set withdrawal-counter (+ withdrawal-id u1))
+        (ok withdrawal-id)
     )
 )
 
-(define-public (mint-wrapped (chain-id uint) (amount uint) (recipient principal))
+(define-public (mint-wrapped (cid uint) (amount uint) (recipient principal))
     (let
         (
-            (current-wrapped (get-user-balance recipient chain-id "wrapped"))
+            (current-wrapped (get-user-balance recipient cid "wrapped"))
         )
         (asserts! (var-get is-bridge-active) ERR-NOT-AUTHORIZED)
-        (asserts! (is-valid-chain chain-id) ERR-INVALID-CHAIN)
+        (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
         (asserts! (>= amount MIN-BRIDGE-AMOUNT) ERR-INVALID-AMOUNT)
         
-        (update-user-balance recipient chain-id (get-user-balance recipient chain-id "locked") (+ current-wrapped amount))
-        (update-chain-totals chain-id 0 (to-int amount))
+        (update-user-balance recipient cid (get-user-balance recipient cid "locked") (+ current-wrapped amount))
+        (update-chain-totals cid 0 (to-int amount))
         (ok amount)
     )
 )
 
-(define-public (burn-wrapped (chain-id uint) (amount uint))
+(define-public (burn-wrapped (cid uint) (amount uint))
     (let
         (
-            (current-wrapped (get-user-balance tx-sender chain-id "wrapped"))
+            (current-wrapped (get-user-balance tx-sender cid "wrapped"))
         )
         (asserts! (var-get is-bridge-active) ERR-NOT-AUTHORIZED)
-        (asserts! (is-valid-chain chain-id) ERR-INVALID-CHAIN)
+        (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
         (asserts! (>= current-wrapped amount) ERR-INSUFFICIENT-BALANCE)
         
-        (update-user-balance tx-sender chain-id (get-user-balance tx-sender chain-id "locked") (- current-wrapped amount))
-        (update-chain-totals chain-id 0 (- (to-int amount)))
+        (update-user-balance tx-sender cid (get-user-balance tx-sender cid "locked") (- current-wrapped amount))
+        (update-chain-totals cid 0 (- (to-int amount)))
         (ok amount)
     )
 )
@@ -193,7 +257,8 @@
 (define-public (bridge-transfer (from-chain uint) (to-chain uint) (amount uint) (recipient principal))
     (let
         (
-            (tx-id (keccak256 (concat (concat (unwrap-panic (to-consensus-buff? tx-sender)) (unwrap-panic (to-consensus-buff? block-height))) (unwrap-panic (to-consensus-buff? amount)))))
+            (current-height stacks-block-height)
+            (tx-id (keccak256 (concat (concat (unwrap-panic (to-consensus-buff? tx-sender)) (unwrap-panic (to-consensus-buff? current-height))) (unwrap-panic (to-consensus-buff? amount)))))
             (current-locked (get-user-balance tx-sender from-chain "locked"))
             (fee-amount (/ (* amount (var-get bridge-fee)) u1000000))
             (transfer-amount (- amount fee-amount))
@@ -218,7 +283,7 @@
                 recipient: recipient,
                 amount: amount,
                 processed: true,
-                block-height: block-height
+                block-height: current-height
             }
         )
         (ok tx-id)
@@ -248,12 +313,75 @@
     )
 )
 
-(define-read-only (get-chain-info (chain-id uint))
-    (map-get? chain-registry { chain-id: chain-id })
+(define-public (claim-withdrawal (withdrawal-id uint))
+    (let
+        (
+            (withdrawal-info (unwrap! (map-get? withdrawal-queue { withdrawal-id: withdrawal-id }) ERR-WITHDRAWAL-NOT-FOUND))
+            (withdrawal-user (get user withdrawal-info))
+            (withdrawal-amount (get amount withdrawal-info))
+            (unlock-height (get unlock-at withdrawal-info))
+            (is-claimed (get claimed withdrawal-info))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender withdrawal-user) ERR-NOT-AUTHORIZED)
+        (asserts! (>= current-height unlock-height) ERR-WITHDRAWAL-LOCKED)
+        (asserts! (not is-claimed) ERR-WITHDRAWAL-ALREADY-CLAIMED)
+        
+        (try! (ft-mint? bridge-token withdrawal-amount tx-sender))
+        
+        (map-set withdrawal-queue
+            { withdrawal-id: withdrawal-id }
+            (merge withdrawal-info { claimed: true })
+        )
+        
+        (ok withdrawal-amount)
+    )
 )
 
-(define-read-only (get-user-chain-balance (user principal) (chain-id uint))
-    (map-get? user-balances { user: user, chain-id: chain-id })
+(define-public (set-chain-timelock (cid uint) (timelock-blocks uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
+        
+        (map-set chain-timelocks
+            { timelock-chain-id: cid }
+            { timelock-blocks: timelock-blocks }
+        )
+        (ok timelock-blocks)
+    )
+)
+
+(define-public (cancel-withdrawal (withdrawal-id uint))
+    (let
+        (
+            (withdrawal-info (unwrap! (map-get? withdrawal-queue { withdrawal-id: withdrawal-id }) ERR-WITHDRAWAL-NOT-FOUND))
+            (withdrawal-user (get user withdrawal-info))
+            (withdrawal-chain (get target-chain-id withdrawal-info))
+            (withdrawal-amount (get amount withdrawal-info))
+            (is-claimed (get claimed withdrawal-info))
+            (current-locked (get-user-balance tx-sender withdrawal-chain "locked"))
+        )
+        (asserts! (is-eq tx-sender withdrawal-user) ERR-NOT-AUTHORIZED)
+        (asserts! (not is-claimed) ERR-WITHDRAWAL-ALREADY-CLAIMED)
+        
+        (update-user-balance tx-sender withdrawal-chain (+ current-locked withdrawal-amount) (get-user-balance tx-sender withdrawal-chain "wrapped"))
+        (update-chain-totals withdrawal-chain (to-int withdrawal-amount) 0)
+        
+        (map-set withdrawal-queue
+            { withdrawal-id: withdrawal-id }
+            (merge withdrawal-info { claimed: true })
+        )
+        
+        (ok withdrawal-amount)
+    )
+)
+
+(define-read-only (get-chain-info (cid uint))
+    (map-get? chain-registry { chain-id: cid })
+)
+
+(define-read-only (get-user-chain-balance (user principal) (cid uint))
+    (map-get? user-balances { user: user, balance-chain-id: cid })
 )
 
 (define-read-only (get-transaction (tx-id (buff 32)))
@@ -272,9 +400,25 @@
     (var-get total-chains)
 )
 
-(define-read-only (is-validator (chain-id uint) (validator principal))
-    (match (map-get? chain-validators { chain-id: chain-id, validator: validator })
+(define-read-only (is-validator (cid uint) (validator principal))
+    (match (map-get? chain-validators { validator-chain-id: cid, validator: validator })
         validator-info (get is-active validator-info)
         false
     )
+)
+
+(define-read-only (get-withdrawal-info (withdrawal-id uint))
+    (map-get? withdrawal-queue { withdrawal-id: withdrawal-id })
+)
+
+(define-read-only (get-user-withdrawals (user principal) (cid uint))
+    (map-get? user-withdrawal-ids { user: user, user-chain-id: cid })
+)
+
+(define-read-only (get-chain-timelock-info (cid uint))
+    (ok (get-chain-timelock cid))
+)
+
+(define-read-only (get-withdrawal-counter)
+    (var-get withdrawal-counter)
 )

@@ -10,6 +10,7 @@
 (define-constant ERR-WITHDRAWAL-NOT-FOUND (err u107))
 (define-constant ERR-WITHDRAWAL-LOCKED (err u108))
 (define-constant ERR-WITHDRAWAL-ALREADY-CLAIMED (err u109))
+(define-constant ERR-ALLOWANCE-INSUFFICIENT (err u110))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MAX-CHAINS u10)
@@ -77,6 +78,11 @@
 (define-map user-withdrawal-ids
     { user: principal, user-chain-id: uint }
     { withdrawal-ids: (list 50 uint) }
+)
+
+(define-map allowances
+    { owner: principal, spender: principal }
+    { amount: uint }
 )
 
 (define-private (is-valid-chain (cid uint))
@@ -421,4 +427,40 @@
 
 (define-read-only (get-withdrawal-counter)
     (var-get withdrawal-counter)
+)
+
+(define-public (approve (spender principal) (amount uint))
+    (begin
+        (map-set allowances { owner: tx-sender, spender: spender } { amount: amount })
+        (ok amount)
+    )
+)
+
+(define-public (revoke-allowance (spender principal))
+    (begin
+        (map-set allowances { owner: tx-sender, spender: spender } { amount: u0 })
+        (ok true)
+    )
+)
+
+(define-public (spend-from (owner principal) (recipient principal) (amount uint))
+    (let
+        (
+            (current-allowance (match (map-get? allowances { owner: owner, spender: tx-sender }) info (get amount info) u0))
+            (owner-balance (ft-get-balance bridge-token owner))
+        )
+        (asserts! (> current-allowance u0) ERR-NOT-AUTHORIZED)
+        (asserts! (>= current-allowance amount) ERR-ALLOWANCE-INSUFFICIENT)
+        (asserts! (>= owner-balance amount) ERR-INSUFFICIENT-BALANCE)
+        (try! (ft-transfer? bridge-token amount owner recipient))
+        (map-set allowances { owner: owner, spender: tx-sender } { amount: (- current-allowance amount) })
+        (ok amount)
+    )
+)
+
+(define-read-only (get-allowance (owner principal) (spender principal))
+    (match (map-get? allowances { owner: owner, spender: spender })
+        info (get amount info)
+        u0
+    )
 )

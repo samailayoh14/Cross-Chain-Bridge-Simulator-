@@ -464,3 +464,28 @@
         u0
     )
 )
+
+(define-read-only (quote-bridge (from-chain uint) (to-chain uint) (amount uint))
+    (if (not (var-get is-bridge-active))
+        ERR-NOT-AUTHORIZED
+        (if (not (is-valid-chain from-chain))
+            ERR-INVALID-CHAIN
+            (if (not (is-valid-chain to-chain))
+                ERR-INVALID-CHAIN
+                (if (is-eq from-chain to-chain)
+                    ERR-INVALID-CHAIN
+                    (if (< amount MIN-BRIDGE-AMOUNT)
+                        ERR-INVALID-AMOUNT
+                        (let
+                            (
+                                (fee-amount (/ (* amount (var-get bridge-fee)) u1000000))
+                                (transfer-amount (- amount fee-amount))
+                            )
+                            (ok { fee: fee-amount, transfer: transfer-amount })
+                        )
+                    )
+                )
+            )
+        )
+    )
+)

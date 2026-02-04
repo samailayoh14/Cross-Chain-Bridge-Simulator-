@@ -11,6 +11,7 @@
 (define-constant ERR-WITHDRAWAL-LOCKED (err u108))
 (define-constant ERR-WITHDRAWAL-ALREADY-CLAIMED (err u109))
 (define-constant ERR-ALLOWANCE-INSUFFICIENT (err u110))
+(define-constant ERR-EXCEEDS-LIMIT (err u111))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MAX-CHAINS u10)
@@ -83,6 +84,21 @@
 (define-map allowances
     { owner: principal, spender: principal }
     { amount: uint }
+)
+
+(define-map chain-caps
+    { chain-id: uint }
+    { max-amount: uint }
+)
+
+(define-private (check-chain-cap (cid uint) (amount uint))
+    (match (map-get? chain-caps { chain-id: cid })
+        cap-info (if (<= amount (get max-amount cap-info))
+            true
+            false
+        )
+        true
+    )
 )
 
 (define-private (is-valid-chain (cid uint))
@@ -186,6 +202,7 @@
         )
         (asserts! (var-get is-bridge-active) ERR-NOT-AUTHORIZED)
         (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
+        (asserts! (check-chain-cap cid amount) ERR-EXCEEDS-LIMIT)
         (asserts! (>= amount MIN-BRIDGE-AMOUNT) ERR-INVALID-AMOUNT)
         (asserts! (>= current-balance amount) ERR-INSUFFICIENT-BALANCE)
         
@@ -237,6 +254,7 @@
         )
         (asserts! (var-get is-bridge-active) ERR-NOT-AUTHORIZED)
         (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
+        (asserts! (check-chain-cap cid amount) ERR-EXCEEDS-LIMIT)
         (asserts! (>= amount MIN-BRIDGE-AMOUNT) ERR-INVALID-AMOUNT)
         
         (update-user-balance recipient cid (get-user-balance recipient cid "locked") (+ current-wrapped amount))
@@ -272,6 +290,8 @@
         (asserts! (var-get is-bridge-active) ERR-NOT-AUTHORIZED)
         (asserts! (is-valid-chain from-chain) ERR-INVALID-CHAIN)
         (asserts! (is-valid-chain to-chain) ERR-INVALID-CHAIN)
+        (asserts! (check-chain-cap from-chain amount) ERR-EXCEEDS-LIMIT)
+        (asserts! (check-chain-cap to-chain amount) ERR-EXCEEDS-LIMIT)
         (asserts! (not (is-eq from-chain to-chain)) ERR-INVALID-CHAIN)
         (asserts! (>= amount MIN-BRIDGE-AMOUNT) ERR-INVALID-AMOUNT)
         (asserts! (>= current-locked amount) ERR-INSUFFICIENT-BALANCE)
@@ -488,4 +508,17 @@
             )
         )
     )
+)
+
+(define-public (set-chain-cap (cid uint) (cap uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (is-valid-chain cid) ERR-INVALID-CHAIN)
+        (map-set chain-caps { chain-id: cid } { max-amount: cap })
+        (ok cap)
+    )
+)
+
+(define-read-only (get-chain-cap (cid uint))
+    (map-get? chain-caps { chain-id: cid })
 )

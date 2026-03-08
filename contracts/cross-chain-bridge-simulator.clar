@@ -22,6 +22,7 @@
 (define-data-var bridge-fee uint u10000)
 (define-data-var is-bridge-active bool true)
 (define-data-var withdrawal-counter uint u0)
+(define-data-var bridge-treasury principal tx-sender)
 
 (define-map chain-registry 
     { chain-id: uint } 
@@ -299,6 +300,7 @@
         
         (update-user-balance tx-sender from-chain (- current-locked amount) (get-user-balance tx-sender from-chain "wrapped"))
         (try! (mint-wrapped to-chain transfer-amount recipient))
+        (try! (mint-wrapped to-chain fee-amount (var-get bridge-treasury)))
         
         (map-set cross-chain-transactions
             { tx-id: tx-id }
@@ -521,4 +523,16 @@
 
 (define-read-only (get-chain-cap (cid uint))
     (map-get? chain-caps { chain-id: cid })
+)
+
+(define-public (set-bridge-treasury (new-treasury principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set bridge-treasury new-treasury)
+        (ok new-treasury)
+    )
+)
+
+(define-read-only (get-bridge-treasury)
+    (ok (var-get bridge-treasury))
 )
